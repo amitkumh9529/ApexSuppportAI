@@ -1,0 +1,349 @@
+"""Agent tools for ApexSupport-AI.
+
+These tools are the only way the agent can touch data or issue money transactions.
+The critical safety invariant lives in `issue_refund`: it re-runs the deterministic
+policy engine and records an *approved* refund ONLY when the policy permits it.
+Nothing the LLM says — including text injected by a malicious user — can override that gate.
+
+Identity is NOT established by the agent. The customer ID comes directly from the
+verified JWT token on the HTTP request and is fixed in `ToolContext` before the agent runs.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from dataclasses import dataclass
+
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+
+from app.agent.guard import detect_injection
+from app.db import session as db
+from app.db.models import Customer, Order, Refund
+from app.policy.engine import evaluate
+from app.services.webhook import dispatch_webhook_event
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class ToolContext:
+    conversation_id: str
+    verified_customer_id: str | None = None
+
+
+UNTRUSTED_PLACEHOLDER = "[text removed: looked like instructions]"
+ESCALATION_REASON_PREFIX = "[Agent summary of the customer's request; claims are unverified] "
+
+
+def untrusted_text(value: str | None) -> str | None:
+    """A free-text field from the database, or a placeholder if it reads like
+    instructions to the model (indirect prompt injection protection)."""
+    if value and detect_injection(value):
+        log.warning("Instruction-like text removed from tool output", extra={"text": value[:200]})
+        return UNTRUSTED_PLACEHOLDER
+    return value
+
+
+def _order_view(order: Order) -> dict:
+    return {
+        "order_id": order.id,
+        "product_name": untrusted_text(order.product_name),
+        "category": untrusted_text(order.category),
+        "amount": float(order.amount),
+        "status": order.status,
+        "delivered_date": order.delivered_date.date().isoformat()
+        if order.delivered_date
+        else None,
+        "is_final_sale": order.is_final_sale,
+        "already_refunded": order.refunded,
+    }
+
+
+def tool_config(ctx: ToolContext) -> dict:
+    """RunnableConfig fragment that carries `ctx` to the tools."""
+    return {"configurable": {"tool_ctx": ctx}}
+
+
+def _ctx(config: RunnableConfig) -> ToolContext:
+    ctx = (config or {}).get("configurable", {}).get("tool_ctx")
+    return ctx if isinstance(ctx, ToolContext) else ToolContext(conversation_id="")
+
+
+def _build_tools() -> list:
+    def _require_identity(ctx: ToolContext) -> str | None:
+        if ctx.verified_customer_id is None:
+            return json.dumps(
+                {
+                    "error": "identity_not_verified",
+                    "message": "No authenticated customer on this conversation.",
+                }
+            )
+        return None
+
+    async def _get_owned_order(
+        ctx: ToolContext, session, order_id: str, for_update: bool = False
+    ) -> tuple[Order | None, str | None]:
+        stmt = select(Order).where(Order.id == order_id)
+        if for_update:
+            stmt = stmt.with_for_update()
+        order = await session.scalar(stmt)
+        if order is None:
+            return None, json.dumps({"error": "order_not_found", "order_id": order_id})
+        if order.customer_id != ctx.verified_customer_id:
+            log.warning(
+                "Cross-customer order access denied",
+                extra={"order_id": order_id, "customer_id": ctx.verified_customer_id},
+            )
+            return None, json.dumps({"error": "order_not_found", "order_id": order_id})
+        return order, None
+
+    @tool
+    async def get_my_profile(config: RunnableConfig) -> str:
+        """Load the authenticated customer's profile (name, email, loyalty tier).
+
+        The customer is already signed in; you never need to ask who they are.
+        """
+        ctx = _ctx(config)
+        guard = _require_identity(ctx)
+        if guard:
+            return guard
+        async with db.SessionLocal() as session:
+            customer = await session.get(Customer, ctx.verified_customer_id)
+        if customer is None:
+            return json.dumps({"found": False, "message": "Customer profile not found."})
+        return json.dumps(
+            {
+                "found": True,
+                "customer_id": customer.id,
+                "name": untrusted_text(customer.name),
+                "email": untrusted_text(customer.email),
+                "loyalty_tier": customer.loyalty_tier,
+            }
+        )
+
+    @tool
+    async def list_orders(config: RunnableConfig) -> str:
+        """List all orders belonging to the signed-in customer."""
+        ctx = _ctx(config)
+        guard = _require_identity(ctx)
+        if guard:
+            return guard
+        async with db.SessionLocal() as session:
+            orders = (
+                await session.scalars(
+                    select(Order)
+                    .where(Order.customer_id == ctx.verified_customer_id)
+                    .order_by(Order.order_date.desc())
+                    .limit(50)
+                )
+            ).all()
+        return json.dumps({"orders": [_order_view(o) for o in orders]})
+
+    @tool
+    async def get_order(order_id: str, config: RunnableConfig) -> str:
+        """Get the details of a single order belonging to the signed-in customer."""
+        ctx = _ctx(config)
+        guard = _require_identity(ctx)
+        if guard:
+            return guard
+        async with db.SessionLocal() as session:
+            order, err = await _get_owned_order(ctx, session, order_id)
+        if err:
+            return err
+        return json.dumps(_order_view(order))
+
+    @tool
+    async def check_refund_eligibility(order_id: str, config: RunnableConfig) -> str:
+        """Check whether an order is eligible for a refund WITHOUT issuing one.
+
+        Runs the deterministic refund policy and returns eligibility, whether the
+        refund requires human escalation, and the exact policy reasons.
+        """
+        ctx = _ctx(config)
+        guard = _require_identity(ctx)
+        if guard:
+            return guard
+        async with db.SessionLocal() as session:
+            order, err = await _get_owned_order(ctx, session, order_id)
+            if err:
+                return err
+            customer = await session.get(Customer, ctx.verified_customer_id)
+            result = evaluate(order, customer)
+        return json.dumps({"order_id": order_id, **result.to_dict()})
+
+    @tool
+    async def issue_refund(order_id: str, config: RunnableConfig) -> str:
+        """Attempt to issue a refund for an order.
+
+        This is the only way to grant a refund. The refund is re-validated
+        against the deterministic policy engine here; an approved refund is
+        recorded ONLY when the code permits it.
+        """
+        ctx = _ctx(config)
+        guard = _require_identity(ctx)
+        if guard:
+            return guard
+
+        async with db.SessionLocal() as session:
+            order, err = await _get_owned_order(ctx, session, order_id, for_update=True)
+            if err:
+                return err
+            customer = await session.get(Customer, ctx.verified_customer_id)
+            result = evaluate(order, customer)
+            decision = result.decision  # approved | denied | escalated
+            reasons = list(result.reasons)
+            amount = order.amount
+
+            session.add(
+                Refund(
+                    order_id=order.id,
+                    amount=amount,
+                    decision=decision,
+                    reason=" ".join(reasons),
+                    decided_by="agent",
+                    conversation_id=ctx.conversation_id,
+                )
+            )
+            if decision == "approved":
+                order.refunded = True
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                decision = "denied"
+                reasons = [f"Order {order_id} has already been refunded."]
+                session.add(
+                    Refund(
+                        order_id=order_id,
+                        amount=amount,
+                        decision=decision,
+                        reason=reasons[0],
+                        decided_by="agent",
+                        conversation_id=ctx.conversation_id,
+                    )
+                )
+                await session.commit()
+
+        # Fire outbound webhook asynchronously
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                dispatch_webhook_event(
+                    event_type=f"refund.{decision}",
+                    payload={
+                        "order_id": order_id,
+                        "customer_id": ctx.verified_customer_id,
+                        "conversation_id": ctx.conversation_id,
+                        "decision": decision,
+                        "amount": float(amount) if decision == "approved" else 0.0,
+                        "reasons": reasons,
+                    },
+                )
+            )
+        except RuntimeError:
+            pass
+
+        return json.dumps(
+            {
+                "order_id": order_id,
+                "decision": decision,
+                "refund_recorded": True,
+                "amount": float(amount) if decision == "approved" else 0.0,
+                "reasons": reasons,
+            }
+        )
+
+    @tool
+    async def escalate_to_human(order_id: str, reason: str, config: RunnableConfig) -> str:
+        """Escalate a refund request to a human specialist.
+
+        Only for orders that the policy sends to a human (eligible, but exceeding
+        the $500 automatic approval limit). Each order is escalated at most once.
+        """
+        ctx = _ctx(config)
+        guard = _require_identity(ctx)
+        if guard:
+            return guard
+        async with db.SessionLocal() as session:
+            order, err = await _get_owned_order(ctx, session, order_id, for_update=True)
+            if err:
+                return err
+            customer = await session.get(Customer, ctx.verified_customer_id)
+            result = evaluate(order, customer)
+            if not (result.eligible and result.requires_escalation):
+                return json.dumps(
+                    {
+                        "error": "escalation_not_allowed",
+                        "order_id": order_id,
+                        "message": "The refund policy does not route this order to a human specialist.",
+                        "reasons": list(result.reasons),
+                    }
+                )
+            existing = await session.scalar(
+                select(Refund.decision)
+                .where(Refund.order_id == order.id, Refund.decision.in_(("escalated", "approved")))
+                .limit(1)
+            )
+            if existing is None:
+                summary = " ".join(reason.split())[:500]
+                session.add(
+                    Refund(
+                        order_id=order.id,
+                        amount=order.amount,
+                        decision="escalated",
+                        reason=ESCALATION_REASON_PREFIX + summary,
+                        decided_by="agent",
+                        conversation_id=ctx.conversation_id,
+                    )
+                )
+                await session.commit()
+
+        if existing is None:
+            message = "Escalated to a human specialist for manual review."
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(
+                    dispatch_webhook_event(
+                        event_type="refund.escalated",
+                        payload={
+                            "order_id": order_id,
+                            "customer_id": ctx.verified_customer_id,
+                            "conversation_id": ctx.conversation_id,
+                            "decision": "escalated",
+                            "amount": float(order.amount),
+                            "reason": ESCALATION_REASON_PREFIX + summary,
+                        },
+                    )
+                )
+            except RuntimeError:
+                pass
+        elif existing == "escalated":
+            message = "Already escalated: a specialist is reviewing it. Nothing new was recorded."
+        else:
+            message = "This order's refund was already approved."
+
+        return json.dumps(
+            {
+                "order_id": order_id,
+                "decision": existing or "escalated",
+                "already_escalated": existing == "escalated",
+                "message": message,
+            }
+        )
+
+    return [
+        get_my_profile,
+        list_orders,
+        get_order,
+        check_refund_eligibility,
+        issue_refund,
+        escalate_to_human,
+    ]
+
+
+TOOLS: list = _build_tools()

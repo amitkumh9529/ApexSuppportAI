@@ -1,0 +1,7 @@
+.venv
+var
+**/__pycache__
+*.pyc
+.pytest_cache
+.env
+redteam/node_modules
