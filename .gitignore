@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+.env
+backend/var/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-cross-origin/
+landing/node_modules/
+landing/dist/
+loadtest/results/
+dump.rdb
+.opik/
+backend/evals/results.json
+
+# Red team run outputs (summary.json is committed after review)
+backend/redteam/node_modules/
+backend/redteam/redteam.yaml
+backend/redteam/results.json
+backend/redteam/findings.jsonl
+backend/redteam/eval.log
+backend/redteam/.npm-install.log
